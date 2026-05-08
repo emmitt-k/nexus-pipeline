@@ -1,0 +1,667 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-08-31
+Description: Nexus Pipeline - ETL with AI column mapping
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    Description: Environment name (dev/staging/prod)
+
+  PostgreSQLName:
+    Type: String
+    Default: nexusdb
+    Description: RDS PostgreSQL database name
+
+  PostgreSQLInstance:
+    Type: String
+    Default: db.t3.micro
+    Description: RDS instance class
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # DynamoDB Table for Jobs
+  # ---------------------------------------------------------------------------
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub nexus-jobs-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: jobId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: jobId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # ---------------------------------------------------------------------------
+  # DynamoDB Table for Schema Cache
+  # ---------------------------------------------------------------------------
+  SchemaCacheTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub nexus-schema-cache-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: cacheKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: cacheKey
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # ---------------------------------------------------------------------------
+  # SQS Queue for Job Processing
+  # ---------------------------------------------------------------------------
+  JobQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub nexus-jobs-${Environment}
+      VisibilityTimeout: 3600
+      MessageRetentionPeriod: 86400
+
+  # ---------------------------------------------------------------------------
+  # S3 Bucket for incoming files
+  # ---------------------------------------------------------------------------
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub nexus-data-${Environment}
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT]
+            AllowedOrigins: ['*']
+            MaxAge: 3000
+
+  # ---------------------------------------------------------------------------
+  # Pipeline Lambda - S3 trigger + AI mapping
+  # ---------------------------------------------------------------------------
+  PipelineFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub nexus-pipeline-${Environment}
+      CodeUri: ../backend/pipeline/
+      Handler: handler.handler
+      Runtime: python3.12
+      Timeout: 60
+      MemorySize: 512
+      Environment:
+        Variables:
+          DYNAMO_TABLE: !Ref JobsTable
+          SCHEMA_CACHE_TABLE: !Ref SchemaCacheTable
+          BEDROCK_MODEL: anthropic.claude-3-sonnet-20240229-v1:0
+      Policies:
+        - DynamoDBAccessPolicy:
+            TableName: !Ref JobsTable
+        - DynamoDBAccessPolicy:
+            TableName: !Ref SchemaCacheTable
+        - S3ReadPolicy:
+            BucketName: !Ref DataBucket
+        - S3BucketPolicy:
+            BucketName: !Ref DataBucket
+      Events:
+        S3ObjectCreated:
+          Type: S3
+          Properties:
+            Bucket: !Ref DataBucket
+            Event: s3:ObjectCreated:*
+            Rule:
+              Filter:
+                S3Key:
+                  FilterRules:
+                    - Name: prefix
+                      Value: /
+                    - Name: suffix
+                      Value: .csv
+
+  # ---------------------------------------------------------------------------
+  # ECS Cluster for Worker
+  # ---------------------------------------------------------------------------
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub nexus-cluster-${Environment}
+
+  # ---------------------------------------------------------------------------
+  # Worker ECS Task Definition
+  # ---------------------------------------------------------------------------
+  WorkerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: nexus-worker
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: 2048
+      Memory: 8192
+      ExecutionRoleArn: !GetAtt WorkerTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt WorkerTaskRole.Arn
+      ContainerDefinitions:
+        - Name: worker
+          Image: worker:latest
+          Environment:
+            - Name: DYNAMO_TABLE
+              Value: !Ref JobsTable
+            - Name: SQS_QUEUE_URL
+              Value: !Ref JobQueue
+            - Name: SCHEMA_CACHE_TABLE
+              Value: !Ref SchemaCacheTable
+          Essential: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              "awslogs-group": !Sub /ecs/nexus-worker-${Environment}
+              "awslogs-region": !Ref AWS::Region
+              "awslogs-stream-prefix": ecs
+
+  WorkerTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub nexus-worker-exec-${Environment}
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+
+  WorkerTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub nexus-worker-task-${Environment}
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+        - arn:aws:iam::aws:policy/SecretsManagerReadWrite
+      Policies:
+        - PolicyName: DynamoDBAccess
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+              Resource: !Ref JobsTable
+        - PolicyName: SQSAccess
+          Statement:
+            - Effect: Allow
+              Action:
+                - sqs:ReceiveMessage
+                - sqs:DeleteMessage
+                - sqs:GetQueueUrl
+              Resource: !GetAtt JobQueue.Arn
+
+  # ---------------------------------------------------------------------------
+  # Worker ECS Service
+  # ---------------------------------------------------------------------------
+  WorkerService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref WorkerTaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: 1
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+          SecurityGroups:
+            - !Ref WorkerSecurityGroup
+
+  WorkerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Worker ECS tasks
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: -1
+          CidrIp: 10.0.0.0/16
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL Database
+  # ---------------------------------------------------------------------------
+    Properties:
+      DBInstanceIdentifier: !Sub nexusdb-${Environment}
+      DBInstanceClass: !Ref PostgreSQLInstance
+      Engine: postgres
+      EngineVersion: '15.4'
+      MasterUsername: !Sub ${Environment}user
+      MasterUserPassword: !Ref DatabasePassword
+      AllocatedStorage: 20
+      StorageType: gp3
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+
+  DatabaseSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub nexus-db-credentials-${Environment}
+      Description: Database credentials for Nexus Pipeline
+      SecretString: !Sub '{"username": "${Environment}user", "password": "${DatabasePassword}", "engine": "postgres"}'
+
+  DatabasePassword:
+    Type: String
+    NoEcho: true
+    Description: Master password for RDS (min 8 chars)
+
+  # ---------------------------------------------------------------------------
+  # VPC for Lambda + RDS
+  # ---------------------------------------------------------------------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.20.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for RDS
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  # NAT Gateway for private subnets
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: !Ref VPC
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet1RouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ---------------------------------------------------------------------------
+  # Security Groups
+  # ---------------------------------------------------------------------------
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Lambda functions
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: -1
+          CidrIp: 10.0.0.0/16
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for RDS
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: 10.0.0.0/16
+
+  # ---------------------------------------------------------------------------
+  # Dashboard API - REST API Gateway
+  # ---------------------------------------------------------------------------
+  NexusApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: dev
+      DefinitionBody:
+        swagger: "2.0"
+        info:
+          title: !Sub nexus-api-${Environment}
+          version: "1.0"
+        schemes:
+          - https
+        basePath: /dev
+        paths:
+          /jobs:
+            get:
+              summary: List jobs
+              operationId: listJobs
+              produces:
+                - application/json
+              parameters:
+                - name: status
+                  in: query
+                  type: string
+                - name: limit
+                  in: query
+                  type: integer
+              responses:
+                "200":
+                  description: 200 response
+                  schema:
+                    type: string
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiFunction.Arn}/invocations
+          /jobs/{jobId}:
+            get:
+              summary: Get job details
+              operationId: getJob
+              produces:
+                - application/json
+              parameters:
+                - name: jobId
+                  in: path
+                  required: true
+                  type: string
+              responses:
+                "200":
+                  description: 200 response
+                "404":
+                  description: 404 response
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiFunction.Arn}/invocations
+          /jobs/{jobId}/approve:
+            post:
+              summary: Approve job
+              operationId: approveJob
+              produces:
+                - application/json
+              parameters:
+                - name: jobId
+                  in: path
+                  required: true
+                  type: string
+              responses:
+                "200":
+                  description: 200 response
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiFunction.Arn}/invocations
+          /jobs/{jobId}/reject:
+            post:
+              summary: Reject job
+              operationId: rejectJob
+              produces:
+                - application/json
+              parameters:
+                - name: jobId
+                  in: path
+                  required: true
+                  type: string
+              responses:
+                "200":
+                  description: 200 response
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiFunction.Arn}/invocations
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub nexus-api-${Environment}
+      CodeUri: ../backend/api/
+      Handler: handler.handler
+      Runtime: python3.12
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          DYNAMO_TABLE: !Ref JobsTable
+          SCHEMA_CACHE_TABLE: !Ref SchemaCacheTable
+          SQS_QUEUE_URL: !Ref JobQueue
+      Policies:
+        - DynamoDBAccessPolicy:
+            TableName: !Ref JobsTable
+        - DynamoDBAccessPolicy:
+            TableName: !Ref SchemaCacheTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt JobQueue.QueueName
+      Events:
+        ApiEvents:
+          Type: Api
+          Properties:
+            RestApiId: !Ref NexusApi
+            Path: /jobs
+            Method: GET
+        ApiJobDetails:
+          Type: Api
+          Properties:
+            RestApiId: !Ref NexusApi
+            Path: /jobs/{jobId}
+            Method: GET
+        ApiApprove:
+          Type: Api
+          Properties:
+            RestApiId: !Ref NexusApi
+            Path: /jobs/{jobId}/approve
+            Method: POST
+        ApiReject:
+          Type: Api
+          Properties:
+            RestApiId: !Ref NexusApi
+            Path: /jobs/{jobId}/reject
+            Method: POST
+
+  ApiUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Properties:
+      UsagePlanName: !Sub nexus-usage-plan-${Environment}
+      Stage:
+        - ApiRef: NexusApi
+
+  ApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: !Sub nexus-api-key-${Environment}
+      Enabled: true
+      StageKeys:
+        - RestApiId: !Ref NexusApi
+          Stage: dev
+
+  ApiKeyAssociation:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref ApiUsagePlan
+
+  # ---------------------------------------------------------------------------
+  # Dashboard Hosting - S3 + CloudFront
+  # ---------------------------------------------------------------------------
+  DashboardBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub nexus-dashboard-${Environment}
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+
+  DashboardCloudFront:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      Enabled: true
+      DefaultRootObject: index.html
+      Origins:
+        - Id: DashboardOrigin
+          CustomOriginConfig:
+            OriginProtocolPolicy: match-viewer
+            HTTPPort: '80'
+            HTTPSPort: '443'
+          DomainName: !GetAtt DashboardBucket.RegionalDomainName
+      DefaultCacheBehavior:
+        TargetOriginId: DashboardOrigin
+        ViewerProtocolPolicy: allow-all
+        Compress: true
+        AllowedMethods:
+          - GET
+          - HEAD
+        CachedMethods:
+          - GET
+          - HEAD
+      HttpVersion: http2and3
+
+  # ---------------------------------------------------------------------------
+  # Outputs
+  # ---------------------------------------------------------------------------
+Outputs:
+  DataBucket:
+    Description: S3 bucket for data files
+    Value: !Ref DataBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-DataBucket
+
+  JobsTable:
+    Description: DynamoDB table for jobs
+    Value: !Ref JobsTable
+    Export:
+      Name: !Sub ${AWS::StackName}-JobsTable
+
+  SchemaCacheTable:
+    Description: DynamoDB table for schema cache
+    Value: !Ref SchemaCacheTable
+    Export:
+      Name: !Sub ${AWS::StackName}-SchemaCacheTable
+
+  PipelineFunction:
+    Description: Pipeline Lambda function
+    Value: !GetAtt PipelineFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-PipelineFunction
+
+  JobQueueUrl:
+    Description: SQS queue URL for job processing
+    Value: !Ref JobQueue
+    Export:
+      Name: !Sub ${AWS::StackName}-JobQueueUrl
+
+  WorkerService:
+    Description: Worker ECS Service
+    Value: !Ref WorkerService
+
+  PostgreSQLEndpoint:
+    Description: PostgreSQL endpoint
+    Value: !GetAtt PostgreSQL.Endpoint.Address
+    Export:
+      Name: !Sub ${AWS::StackName}-PostgreSQLEndpoint
+
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub ${AWS::StackName}-VPCId
+
+  ApiEndpoint:
+    Description: Dashboard API endpoint
+    Value: !Sub https://${NexusApi}.execute-api.${AWS::Region}.amazonaws.com/dev
+    Export:
+      Name: !Sub ${AWS::StackName}-ApiEndpoint
+
+  ApiKeyValue:
+    Description: Dashboard API key
+    Value: !Ref ApiKey
+
+  DashboardUrl:
+    Description: Dashboard URL
+    Value: !Sub https://${DashboardCloudFront}.cloudfront.net
+    Export:
+      Name: !Sub ${AWS::StackName}-DashboardUrl

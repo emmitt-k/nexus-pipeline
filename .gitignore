@@ -1,0 +1,6 @@
+.claude
+backend/*/__pycache__
+frontend/.env
+CLAUDE.md
+FEASIBILITY.md
+linkedin
